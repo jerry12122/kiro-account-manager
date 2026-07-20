@@ -83,6 +83,95 @@ pub async fn get_kiro_local_token() -> Option<KiroLocalToken> {
     .flatten()
 }
 
+/// 用仍有效的 access/refresh 覆盖 IDE 本地 token（同账号续命）。
+///
+/// 只改 `accessToken` / `refreshToken` / `expiresAt`，保留 authMethod、provider、
+/// clientIdHash、region、profileArn 等字段，避免当成完整切号。
+pub async fn update_kiro_local_tokens(
+    access_token: String,
+    refresh_token: String,
+    expires_at_rfc3339: Option<String>,
+) -> Result<(), String> {
+    if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
+        return Err("accessToken / refreshToken 不能为空".to_string());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map_err(|_| "Cannot find home directory".to_string())?;
+        let dir_path = std::path::Path::new(&home)
+            .join(".aws")
+            .join("sso")
+            .join("cache");
+        let file_path = dir_path.join("kiro-auth-token.json");
+
+        if !file_path.exists() {
+            return Err("IDE 本地 token 文件不存在，无法覆盖".to_string());
+        }
+        assert_not_symlink(&file_path)?;
+
+        let content = std::fs::read_to_string(&file_path)
+            .map_err(|e| format!("读取 IDE token 失败: {e}"))?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("解析 IDE token 失败: {e}"))?;
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| "IDE token 格式无效".to_string())?;
+
+        let expires = expires_at_rfc3339.unwrap_or_else(|| {
+            (chrono::Utc::now() + chrono::Duration::hours(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        obj.insert(
+            "accessToken".to_string(),
+            serde_json::Value::String(access_token),
+        );
+        obj.insert(
+            "refreshToken".to_string(),
+            serde_json::Value::String(refresh_token),
+        );
+        obj.insert(
+            "expiresAt".to_string(),
+            serde_json::Value::String(expires),
+        );
+
+        let serialized = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("序列化 IDE token 失败: {e}"))?;
+
+        let temp_path = dir_path.join("kiro-auth-token.json.tmp");
+        if temp_path.exists() {
+            assert_not_symlink(&temp_path)?;
+            std::fs::remove_file(&temp_path)
+                .map_err(|e| format!("Failed to remove existing temp file: {e}"))?;
+        }
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| format!("Failed to create temp file: {e}"))?;
+        file.write_all(serialized.as_bytes())
+            .map_err(|e| format!("Failed to write temp file: {e}"))?;
+        drop(file);
+
+        std::fs::rename(&temp_path, &file_path)
+            .map_err(|e| format!("Failed to rename file: {e}"))?;
+
+        // 强制更新 mtime，让 IDE fs.watchFile 能感知
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        set_file_permissions(&file_path).ok();
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task failed: {e}"))?
+}
+
 /// 读取 `IdC` 客户端注册信息
 pub async fn get_client_registration(client_id_hash: &str) -> Option<ClientRegistration> {
     // 安全检查：防止路径遍历攻击

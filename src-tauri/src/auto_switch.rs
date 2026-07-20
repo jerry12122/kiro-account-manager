@@ -2,7 +2,10 @@
 // 使用 tokio::time::interval 实现真正的后台定时检查
 
 use crate::commands::app_settings_cmd::{get_app_settings_inner, AppSettings};
-use crate::commands::common::{account_machine_id_or_new, save_store};
+use crate::commands::common::{
+    account_machine_id_or_new, apply_refreshed_account_tokens, get_usage_by_account,
+    refresh_token_by_provider, save_store, UsageResult,
+};
 use crate::commands::machine_guid::set_custom_machine_guid;
 use crate::core::account::Account;
 use crate::state::AppState;
@@ -266,54 +269,14 @@ async fn check_and_auto_switch(app_handle: &AppHandle, threshold: f64) {
 /// 4. 用本地 accessToken 调 getUsageLimits 取 email，再按 email 匹配列表，
 ///    并回写本地 token 到 store（修复 IDE/本机刷新后 RT 漂移导致永远匹配不上）
 async fn get_current_account(app_handle: &AppHandle, accounts: &[Account]) -> Option<Account> {
-    // 读取本地 Kiro Token
     let local_token = crate::kiro::ide::get_kiro_local_token().await?;
 
-    // 优先用 refreshToken 匹配
-    if let Some(refresh_token) = local_token.refresh_token.as_ref() {
-        if let Some(acc) = accounts.iter().find(|acc| {
-            acc.refresh_token
-                .as_ref()
-                .map(|rt| rt == refresh_token)
-                .unwrap_or(false)
-        }) {
-            return Some(acc.clone());
-        }
-    }
-
-    // 降级：accessToken 全等，再前缀（token refresh 后 RT 变了）
-    if let Some(access_token) = local_token.access_token.as_ref() {
-        if let Some(acc) = accounts.iter().find(|acc| {
-            acc.access_token
-                .as_ref()
-                .map(|at| at == access_token)
-                .unwrap_or(false)
-        }) {
-            return Some(acc.clone());
-        }
-        let prefix = &access_token[..access_token.len().min(20)];
-        if let Some(acc) = accounts.iter().find(|acc| {
-            acc.access_token
-                .as_ref()
-                .map(|at| at.starts_with(prefix))
-                .unwrap_or(false)
-        }) {
-            return Some(acc.clone());
-        }
-    }
-
-    // 再降级：用 clientIdHash 匹配（IdC 账号；Social 通常为空）
-    if let Some(hash) = local_token.client_id_hash.as_ref() {
-        if !hash.trim().is_empty() {
-            if let Some(acc) = accounts.iter().find(|acc| {
-                acc.client_id_hash
-                    .as_ref()
-                    .map(|h| h == hash)
-                    .unwrap_or(false)
-            }) {
-                return Some(acc.clone());
-            }
-        }
+    // RT / AT / clientIdHash（与 Token refresh 共用匹配规则）
+    if let Some(acc) = accounts
+        .iter()
+        .find(|acc| crate::kiro::token_sync::account_matches_ide_token(acc, &local_token))
+    {
+        return Some(acc.clone());
     }
 
     // 最终回退：usage 反查 email（并同步 token，避免下次再失败）
@@ -497,26 +460,140 @@ fn calculate_remaining(account: &Account) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 尝试用指定 accessToken 拉配额；认证错误返回 Ok(None)，其它错误透传
+async fn try_usage_with_token(
+    account: &Account,
+    access_token: &str,
+) -> Result<Option<UsageResult>, String> {
+    let usage_result = get_usage_by_account(account, access_token).await?;
+    if usage_result.is_auth_error {
+        Ok(None)
+    } else {
+        Ok(Some(usage_result))
+    }
+}
+
 /// 实时刷新账号 usage 并写回 store（自动切号决策用）
+///
+/// Token 策略：
+/// 1. 优先 IDE 本地 accessToken（当前登录态）
+/// 2. IDE 失效时降级用 KAM 账号 accessToken；若也失效则 refresh 一次
+/// 3. KAM 侧成功时，把 access/refresh 回写到 IDE，避免两边继续漂移
 async fn refresh_account_usage_for_switch(
     app_handle: &AppHandle,
     account: &Account,
 ) -> Result<Account, String> {
-    // 优先本地 IDE token（当前登录态），否则用列表里缓存的 accessToken
     let local = crate::kiro::ide::get_kiro_local_token().await;
-    let access_token = local
+    let ide_access = local
         .as_ref()
         .and_then(|t| t.access_token.clone())
-        .filter(|s| !s.is_empty())
-        .or_else(|| account.access_token.clone())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "当前账号无 accessToken，无法刷新配额".to_string())?;
+        .filter(|s| !s.is_empty());
+    let kam_access = account
+        .access_token
+        .clone()
+        .filter(|s| !s.is_empty());
+
+    let mut usage_result: Option<UsageResult> = None;
+    let mut sync_ide_from_kam = false;
+    let mut account_for_sync = account.clone();
+
+    // 1) IDE token
+    if let Some(ref at) = ide_access {
+        match try_usage_with_token(account, at).await? {
+            Some(ok) => usage_result = Some(ok),
+            None => {
+                log::warn!(
+                    "[AutoSwitch] IDE accessToken 无效，降级尝试 KAM token: {}",
+                    account.email.as_deref().unwrap_or("未知")
+                );
+            }
+        }
+    }
+
+    // 2) KAM accessToken（与 IDE 相同则跳过，避免重复打点）
+    if usage_result.is_none() {
+        if let Some(ref at) = kam_access {
+            let same_as_ide = ide_access.as_ref().is_some_and(|ide| ide == at);
+            if !same_as_ide {
+                match try_usage_with_token(account, at).await? {
+                    Some(ok) => {
+                        usage_result = Some(ok);
+                        sync_ide_from_kam = true;
+                    }
+                    None => {
+                        log::warn!(
+                            "[AutoSwitch] KAM accessToken 也无效，尝试 refresh: {}",
+                            account.email.as_deref().unwrap_or("未知")
+                        );
+                    }
+                }
+            } else if ide_access.is_some() {
+                // IDE 已失败且与 KAM 相同，直接走 refresh
+                log::warn!(
+                    "[AutoSwitch] KAM accessToken 与 IDE 相同且已失效，尝试 refresh: {}",
+                    account.email.as_deref().unwrap_or("未知")
+                );
+            }
+        }
+    }
+
+    // 3) refresh KAM token 后再试
+    if usage_result.is_none() {
+        if account.refresh_token.as_ref().is_none_or(|s| s.trim().is_empty()) {
+            return Err("AUTH_ERROR: 刷新配额时 token 无效".to_string());
+        }
+
+        match refresh_token_by_provider(account).await {
+            Ok(refresh) => {
+                {
+                    let state = app_handle.state::<AppState>();
+                    let mut store = match state.store.lock() {
+                        Ok(s) => s,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    store.reload();
+                    if let Some(acc) = store.accounts.iter_mut().find(|a| a.id == account.id) {
+                        apply_refreshed_account_tokens(acc, &refresh);
+                        account_for_sync = acc.clone();
+                        save_store(&store)?;
+                    } else {
+                        apply_refreshed_account_tokens(&mut account_for_sync, &refresh);
+                    }
+                }
+
+                match try_usage_with_token(&account_for_sync, &refresh.access_token).await? {
+                    Some(ok) => {
+                        usage_result = Some(ok);
+                        sync_ide_from_kam = true;
+                    }
+                    None => {
+                        return Err("AUTH_ERROR: 刷新配额时 token 无效".to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "[AutoSwitch] KAM token refresh 失败: {}: {e}",
+                    account.email.as_deref().unwrap_or("未知")
+                );
+                return Err("AUTH_ERROR: 刷新配额时 token 无效".to_string());
+            }
+        }
+    }
 
     let usage_result =
-        crate::commands::common::get_usage_by_account(account, &access_token).await?;
+        usage_result.ok_or_else(|| "AUTH_ERROR: 刷新配额时 token 无效".to_string())?;
 
-    if usage_result.is_auth_error {
-        return Err("AUTH_ERROR: 刷新配额时 token 无效".to_string());
+    if sync_ide_from_kam {
+        match crate::kiro::token_sync::sync_kam_tokens_to_ide(&account_for_sync).await {
+            Ok(()) => log::info!(
+                "[AutoSwitch] 已用 KAM token 覆盖 IDE access/refresh: {}",
+                account_for_sync.email.as_deref().unwrap_or("未知")
+            ),
+            Err(e) => log::warn!(
+                "[AutoSwitch] 回写 IDE token 失败（配额已用 KAM 刷新）: {e}"
+            ),
+        }
     }
 
     let usage_data = usage_result.usage_data;
@@ -528,13 +605,17 @@ async fn refresh_account_usage_for_switch(
         Err(poisoned) => poisoned.into_inner(),
     };
     store.reload();
-    let mut updated = account.clone();
+    let mut updated = account_for_sync.clone();
     if let Some(acc) = store.accounts.iter_mut().find(|a| a.id == account.id) {
+        // refresh 路径可能已写过 token；这里以 store 现值为准再补 usage
         acc.usage_data = Some(usage_data.clone());
         if usage_result.is_banned {
             acc.status = "banned".to_string();
         } else if crate::core::usage::is_usage_capped(Some(&usage_data)) {
             acc.status = "capped".to_string();
+        } else if acc.status == "invalid" {
+            // KAM/IDE 已能查到配额，解除误标 invalid（不强制改 enabled）
+            acc.status = "active".to_string();
         }
         updated = acc.clone();
         save_store(&store)?;
@@ -837,4 +918,5 @@ mod tests {
             account.machine_id.as_deref().unwrap().trim()
         );
     }
+
 }
