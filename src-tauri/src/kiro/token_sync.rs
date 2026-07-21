@@ -115,28 +115,40 @@ pub fn account_matches_ide_token(account: &Account, local: &KiroLocalToken) -> b
     false
 }
 
-/// 若账号匹配 IDE 当前登录，则把 KAM token 回写 IDE；返回是否已尝试回写
+/// 若账号匹配 IDE 当前登录，则把 KAM token 回写 IDE（并同步 CLI）；返回是否已写入
+#[allow(dead_code)] // 便捷封装；刷新路径请用 sync_kam_tokens_to_ide_if_matches
 pub async fn sync_kam_tokens_to_ide_if_current(account: &Account) -> Result<bool, String> {
+    sync_kam_tokens_to_ide_if_matches(account, account).await
+}
+
+/// 用 `identity` 判断是否 IDE 当前号，匹配则写入 `tokens` 的 access/refresh/expires。
+///
+/// 刷新场景必须把「刷新前账号」当 identity、「刷新后账号」当 tokens：
+/// 否则 RT/AT 已轮换，会误判非当前号而跳过覆盖。
+pub async fn sync_kam_tokens_to_ide_if_matches(
+    identity: &Account,
+    tokens: &Account,
+) -> Result<bool, String> {
     let Some(local) = ide::get_kiro_local_token().await else {
         log::debug!(
             "[TokenSync] skip IDE write: no local token ({})",
-            account.email.as_deref().unwrap_or("未知")
+            identity.email.as_deref().unwrap_or("未知")
         );
         return Ok(false);
     };
 
-    if !account_matches_ide_token(account, &local) {
+    if !account_matches_ide_token(identity, &local) {
         log::debug!(
             "[TokenSync] skip IDE write: account is not IDE current login ({})",
-            account.email.as_deref().unwrap_or("未知")
+            identity.email.as_deref().unwrap_or("未知")
         );
         return Ok(false);
     }
 
-    sync_kam_tokens_to_ide(account).await?;
+    sync_kam_tokens_to_ide(tokens).await?;
     log::info!(
-        "[TokenSync] wrote KAM access/refresh to IDE for {}",
-        account.email.as_deref().unwrap_or("未知")
+        "[TokenSync] wrote KAM access/refresh to IDE(+CLI) for {}",
+        tokens.email.as_deref().unwrap_or("未知")
     );
     Ok(true)
 }

@@ -162,6 +162,18 @@ pub async fn sync_account(
         Err(_) => false,
     };
 
+    // 刷新前先记下是否为 IDE 当前号（刷新后 RT/AT 会变，不能再用新 token 匹配）
+    let was_ide_current = if needs_refresh {
+        match crate::kiro::ide::get_kiro_local_token().await {
+            Some(local) => {
+                crate::kiro::token_sync::account_matches_ide_token(&account, &local)
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
     if needs_refresh {
         match refresh_token_by_provider(&account).await {
             Ok(refreshed) => {
@@ -195,92 +207,106 @@ pub async fn sync_account(
         }
     };
 
-    let mut store = lock_store(&state.store, "store")?;
-    let result = if let Some(a) = store.accounts.iter_mut().find(|a| a.id == id) {
-        // 如果生成了新的 machine_id，保存它（所有账号都需要）
-        if account.machine_id.is_some()
-            && a.machine_id.as_ref().is_none_or(|id| id.trim().is_empty())
-        {
-            a.machine_id = account.machine_id.clone();
-            log::info!("Saved account-scoped machine_id for account: {}", a.id);
-        }
-
-        // 如果刷新了 token，更新 token 相关字段
-        if let Some(ref result) = refresh_result {
-            clear_available_models_cache(a);
-
-            let email_display = a
-                .email
-                .as_deref()
-                .or(a.user_id.as_deref())
-                .unwrap_or("Unknown");
-
-            // 刷新 Token 成功，更新账号信息
-            a.access_token = Some(result.access_token.clone());
-            if let Some(ref refresh_token) = result.refresh_token {
-                a.refresh_token = Some(refresh_token.clone());
-            }
-            // IdC/Enterprise refresh 通常不回 profileArn；勿用 None 覆盖已存真实 ARN
-            if result
-                .profile_arn
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty())
+    let synced_account = {
+        let mut store = lock_store(&state.store, "store")?;
+        let result = if let Some(a) = store.accounts.iter_mut().find(|a| a.id == id) {
+            // 如果生成了新的 machine_id，保存它（所有账号都需要）
+            if account.machine_id.is_some()
+                && a.machine_id.as_ref().is_none_or(|id| id.trim().is_empty())
             {
-                a.profile_arn = result.profile_arn.clone();
+                a.machine_id = account.machine_id.clone();
+                log::info!("Saved account-scoped machine_id for account: {}", a.id);
             }
-            a.id_token = result.id_token.clone();
-            a.sso_session_id = result.sso_session_id.clone();
-            a.expires_at = Some(calc_expires_at(result.expires_in));
 
-            log::info!(
-                "Token refreshed successfully for account: {}",
-                email_display
-            );
-        }
+            // 如果刷新了 token，更新 token 相关字段
+            if let Some(ref result) = refresh_result {
+                clear_available_models_cache(a);
 
-        // 只有成功获取配额时才更新 usage_data 和 status
-        if let Some(usage_data) = usage {
-            // Enterprise 首次同步时落库 ListAvailableProfiles 发现的 profileArn
-            if let Some(ref arn) = usage_data.resolved_profile_arn {
-                if a.profile_arn.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                    a.profile_arn = Some(arn.clone());
+                let email_display = a
+                    .email
+                    .as_deref()
+                    .or(a.user_id.as_deref())
+                    .unwrap_or("Unknown");
+
+                // 刷新 Token 成功，更新账号信息
+                a.access_token = Some(result.access_token.clone());
+                if let Some(ref refresh_token) = result.refresh_token {
+                    a.refresh_token = Some(refresh_token.clone());
                 }
+                // IdC/Enterprise refresh 通常不回 profileArn；勿用 None 覆盖已存真实 ARN
+                if result
+                    .profile_arn
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    a.profile_arn = result.profile_arn.clone();
+                }
+                a.id_token = result.id_token.clone();
+                a.sso_session_id = result.sso_session_id.clone();
+                a.expires_at = Some(calc_expires_at(result.expires_in));
+
+                log::info!(
+                    "Token refreshed successfully for account: {}",
+                    email_display
+                );
             }
 
-            // 直接移动所有权，避免 clone
-            a.usage_data = Some(usage_data.usage_data);
-            update_account_status(a, usage_data.is_banned, usage_data.is_auth_error);
-
-            // 从 usage_data 中提取并更新 email 和 user_id
-            if let Some(user_info) = a.usage_data.as_ref().and_then(|d| d.get("userInfo")) {
-                if let Some(email) = user_info.get("email").and_then(|v| v.as_str()) {
-                    if !email.is_empty() {
-                        a.email = Some(email.to_string());
+            // 只有成功获取配额时才更新 usage_data 和 status
+            if let Some(usage_data) = usage {
+                // Enterprise 首次同步时落库 ListAvailableProfiles 发现的 profileArn
+                if let Some(ref arn) = usage_data.resolved_profile_arn {
+                    if a.profile_arn.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                        a.profile_arn = Some(arn.clone());
                     }
                 }
-                if let Some(user_id) = user_info.get("userId").and_then(|v| v.as_str()) {
-                    a.user_id = Some(user_id.to_string());
+
+                // 直接移动所有权，避免 clone
+                a.usage_data = Some(usage_data.usage_data);
+                update_account_status(a, usage_data.is_banned, usage_data.is_auth_error);
+
+                // 从 usage_data 中提取并更新 email 和 user_id
+                if let Some(user_info) = a.usage_data.as_ref().and_then(|d| d.get("userInfo")) {
+                    if let Some(email) = user_info.get("email").and_then(|v| v.as_str()) {
+                        if !email.is_empty() {
+                            a.email = Some(email.to_string());
+                        }
+                    }
+                    if let Some(user_id) = user_info.get("userId").and_then(|v| v.as_str()) {
+                        a.user_id = Some(user_id.to_string());
+                    }
+                }
+            } else if refresh_result.is_some() {
+                // 获取配额失败，但 token 刷新成功了，说明 token 是有效的
+                // 将状态设置为 active（避免显示为失效状态）
+                if !matches!(a.status.as_str(), "banned" | "封禁" | "已封禁") {
+                    a.status = "active".to_string();
                 }
             }
-        } else if refresh_result.is_some() {
-            // 获取配额失败，但 token 刷新成功了，说明 token 是有效的
-            // 将状态设置为 active（避免显示为失效状态）
-            if !matches!(a.status.as_str(), "banned" | "封禁" | "已封禁") {
-                a.status = "active".to_string();
-            }
-        }
 
-        // 克隆结果（这个必须 clone，因为要返回给前端）
-        Some(a.clone())
-    } else {
-        None
+            // 克隆结果（这个必须 clone，因为要返回给前端）
+            Some(a.clone())
+        } else {
+            None
+        };
+
+        save_store(&store)?;
+        result
     };
 
-    // 保存文件
-    save_store(&store)?;
+    // 若本次刷新的是 IDE 当前号，覆盖 IDE + CLI 本地凭证
+    if was_ide_current {
+        if let Some(ref updated) = synced_account {
+            if let Err(e) = crate::kiro::token_sync::sync_kam_tokens_to_ide(updated).await {
+                log::warn!(
+                    "[sync_account] IDE/CLI token overwrite failed for {}: {e}",
+                    updated.email.as_deref().unwrap_or("未知")
+                );
+            }
+        }
+    }
 
-    match result {
+    match synced_account {
         Some(account) => Ok(SyncAccountResult { account, warning }),
         None => Err("Account not found after update".to_string()),
     }
@@ -420,6 +446,12 @@ pub async fn refresh_token(
         }
     }
 
+    // 刷新前记下是否 IDE 当前号（刷新后 token 会变）
+    let was_ide_current = match crate::kiro::ide::get_kiro_local_token().await {
+        Some(local) => crate::kiro::token_sync::account_matches_ide_token(&account, &local),
+        None => false,
+    };
+
     let refresh_result = match refresh_token_by_provider(&account).await {
         Ok(result) => result,
         Err(e) => {
@@ -439,13 +471,15 @@ pub async fn refresh_token(
         }
     };
 
-    let mut store = lock_store(&state.store, "store")?;
-    if let Some(a) = store.accounts.iter_mut().find(|a| a.id == id) {
+    let result = {
+        let mut store = lock_store(&state.store, "store")?;
+        let Some(a) = store.accounts.iter_mut().find(|a| a.id == id) else {
+            return Err("Account not found after update".to_string());
+        };
         clear_available_models_cache(a);
         if a.machine_id.as_ref().is_none_or(|id| id.trim().is_empty()) {
             a.machine_id = generated_machine_id;
         }
-        // 直接移动所有权，避免 clone
         a.access_token = Some(refresh_result.access_token);
         a.refresh_token = refresh_result.refresh_token;
         a.expires_at = Some(calc_expires_at(refresh_result.expires_in));
@@ -457,9 +491,19 @@ pub async fn refresh_token(
         }
         let result = a.clone();
         save_store(&store)?;
-        return Ok(result);
+        result
+    };
+
+    if was_ide_current {
+        if let Err(e) = crate::kiro::token_sync::sync_kam_tokens_to_ide(&result).await {
+            log::warn!(
+                "[refresh_token] IDE/CLI token overwrite failed for {}: {e}",
+                result.email.as_deref().unwrap_or("未知")
+            );
+        }
     }
-    Err("Account not found after update".to_string())
+
+    Ok(result)
 }
 
 #[tauri::command]

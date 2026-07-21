@@ -8,7 +8,7 @@ use crate::commands::common::{
 use crate::core::account::Account;
 use crate::kiro::token_sync::{
     apply_ide_tokens_to_account, record_refresh_auth_failure, should_skip_refresh_cooldown,
-    sync_kam_tokens_to_ide_if_current, REFRESH_AUTH_FAILURE_STRIKES_TO_DISABLE,
+    sync_kam_tokens_to_ide_if_matches, REFRESH_AUTH_FAILURE_STRIKES_TO_DISABLE,
 };
 use crate::state::AppState;
 use std::collections::{HashMap, HashSet};
@@ -284,7 +284,7 @@ impl TokenRefreshService {
             from_rescue
         );
 
-        match sync_kam_tokens_to_ide_if_current(&snapshot).await {
+        match sync_kam_tokens_to_ide_if_matches(account, &snapshot).await {
             Ok(wrote) => {
                 log::info!(
                     "[TokenRefresh] ide_sync account={} is_ide_current_and_wrote={}",
