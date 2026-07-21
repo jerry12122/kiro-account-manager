@@ -1,4 +1,4 @@
-//! KAM ↔ IDE token 同步与匹配（供 AutoSwitch / Token refresh loop 共用）
+//! KAM ↔ IDE/CLI token 同步与匹配（供 AutoSwitch / Token refresh loop 共用）
 
 use crate::core::account::Account;
 use crate::kiro::ide::{self, KiroLocalToken};
@@ -19,7 +19,8 @@ pub fn kam_expires_at_to_ide_rfc3339(expires_at: Option<&str>) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// 用 KAM 账号上的 access/refresh 覆盖 IDE 本地凭证（同账号续命，不改 authMethod/provider）
+/// 用 KAM 账号上的 access/refresh 覆盖 IDE 本地凭证（同账号续命，不改 authMethod/provider）。
+/// IDE 写成功后会尽量同步 CLI（无 CLI 数据库时跳过，不影响 IDE）。
 pub async fn sync_kam_tokens_to_ide(account: &Account) -> Result<(), String> {
     let access = account
         .access_token
@@ -39,7 +40,24 @@ pub async fn sync_kam_tokens_to_ide(account: &Account) -> Result<(), String> {
         refresh.to_string(),
         Some(kam_expires_at_to_ide_rfc3339(account.expires_at.as_deref())),
     )
-    .await
+    .await?;
+
+    match crate::kiro::cli::sync_account_to_cli(account) {
+        Ok(true) => log::info!(
+            "[TokenSync] also wrote access/refresh/expires_at to CLI for {}",
+            account.email.as_deref().unwrap_or("未知")
+        ),
+        Ok(false) => log::debug!(
+            "[TokenSync] skip CLI write: database not found ({})",
+            account.email.as_deref().unwrap_or("未知")
+        ),
+        Err(e) => log::warn!(
+            "[TokenSync] CLI write failed after IDE sync ({}): {e}",
+            account.email.as_deref().unwrap_or("未知")
+        ),
+    }
+
+    Ok(())
 }
 
 /// 本地匹配：账号是否为 IDE 当前登录号（不含网络 usage 反查）

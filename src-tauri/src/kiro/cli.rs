@@ -1,3 +1,5 @@
+use crate::core::account::Account;
+use crate::utils::client_id_hash::normalize_start_url;
 use rusqlite::{Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -555,6 +557,169 @@ pub fn detect_cli_database() -> Option<String> {
 
     // 返回默认路径（即使不存在）
     candidates.first().map(|p| p.to_string_lossy().to_string())
+}
+
+/// 仅在数据库文件已存在时返回路径（不回退到默认占位路径）
+pub fn detect_existing_cli_database() -> Option<String> {
+    get_cli_database_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+/// CLI token 的 expires_at：优先用账号已有过期时间，否则 now+1h。
+/// 真实 kiro-cli 用 RFC3339 + `Z` + 微秒（而非 chrono 默认的 `+00:00`）。
+fn cli_token_expires_at(account: &Account) -> String {
+    use chrono::TimeZone;
+
+    if let Some(raw) = account
+        .expires_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y/%m/%d %H:%M:%S") {
+            if let Some(local) = chrono::Local.from_local_datetime(&naive).single() {
+                return local
+                    .with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            }
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+            return dt
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        }
+    }
+
+    (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// 构造切号载荷（从 Account 转换为 CLI 2.0 格式）
+pub fn build_cli_switch_payload(account: &Account) -> Result<KiroCliSwitchPayload, String> {
+    let provider = account.provider.as_ref().ok_or("账号缺少 provider 字段")?;
+    let (token_key, device_reg_key, auth_method) = match provider.as_str() {
+        // Enterprise 也是 IdC/SSO，写入 odic key（真实 kiro-cli 实测样本即来自 SSO 登录）
+        "BuilderId" | "Enterprise" => (
+            "kirocli:odic:token",
+            "kirocli:odic:device-registration",
+            "IdC",
+        ),
+        "Google" | "Github" => (
+            "kirocli:social:token",
+            "kirocli:social:device-registration",
+            "social",
+        ),
+        _ => return Err(format!("不支持的 provider: {provider}")),
+    };
+
+    // Social 默认 profile_arn（与 Electron 版本一致；IdC token 不带 profile_arn）
+    const SOCIAL_PROFILE_ARN: &str =
+        "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+    // CLI 默认 Builder ID start_url（Enterprise 用账号自带的 d-xxx start_url）
+    const DEFAULT_START_URL: &str = crate::commands::common::KIRO_BUILDER_ID_START_URL;
+
+    let default_region = "us-east-1".to_string();
+    let region = account.region.as_ref().unwrap_or(&default_region);
+    let token_expires_at = cli_token_expires_at(account);
+
+    let mut token_data = serde_json::json!({
+        "access_token": account.access_token,
+        "refresh_token": account.refresh_token,
+        "expires_at": token_expires_at,
+        "region": region,
+        "oauth_flow": "Pkce",
+        "scopes": [
+            "codewhisperer:completions",
+            "codewhisperer:analysis",
+            "codewhisperer:conversations"
+        ],
+    });
+
+    if auth_method == "IdC" {
+        // IdC/SSO token：带 start_url，且 **不带** profile_arn（与真实 kiro-cli 一致）
+        let start_url = match provider.as_str() {
+            "BuilderId" => account
+                .start_url
+                .as_deref()
+                .map(normalize_start_url)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_START_URL.to_string()),
+            // Enterprise 必须用账号自带的 d-xxx 域名，绝不能回退到 BuilderId 默认值
+            "Enterprise" => {
+                let url = account
+                    .start_url
+                    .as_deref()
+                    .map(normalize_start_url)
+                    .filter(|s| !s.is_empty())
+                    .ok_or(
+                        "Enterprise 账号必须提供 start_url（企业自己的 d-xxx 域名），\
+                         不能为空",
+                    )?;
+                if crate::commands::common::is_builder_id_start_url(&url) {
+                    return Err(
+                        "Enterprise 账号的 start_url 不能是 BuilderId 默认值\
+                         （https://view.awsapps.com/start），请填入企业自己的 d-xxx 域名"
+                            .to_string(),
+                    );
+                }
+                url
+            }
+            _ => return Err(format!("不支持的 IdC provider: {provider}")),
+        };
+        token_data["start_url"] = serde_json::json!(start_url);
+    } else {
+        token_data["start_url"] = serde_json::json!(DEFAULT_START_URL);
+        let profile_arn = account
+            .profile_arn
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(SOCIAL_PROFILE_ARN);
+        token_data["profile_arn"] = serde_json::json!(profile_arn);
+    }
+
+    let token_value =
+        serde_json::to_string(&token_data).map_err(|e| format!("序列化 token 失败: {e}"))?;
+
+    // device-registration：本地未持久化 client_secret 过期时间，按 90 天兜底
+    let secret_expires_at = (chrono::Utc::now() + chrono::Duration::days(90))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let empty = String::new();
+    let device_reg_data = serde_json::json!({
+        "client_id": account.client_id.as_ref().unwrap_or(&empty),
+        "client_secret": account.client_secret.as_ref().unwrap_or(&empty),
+        "client_secret_expires_at": secret_expires_at,
+        "region": region,
+        "oauth_flow": "Pkce",
+        "scopes": [
+            "codewhisperer:completions",
+            "codewhisperer:analysis",
+            "codewhisperer:conversations"
+        ],
+    });
+
+    let device_reg_value = serde_json::to_string(&device_reg_data)
+        .map_err(|e| format!("序列化 device registration 失败: {e}"))?;
+
+    Ok(KiroCliSwitchPayload {
+        token_key: token_key.to_string(),
+        token_value,
+        device_reg_key: device_reg_key.to_string(),
+        device_reg_value,
+    })
+}
+
+/// 把 KAM 账号凭证写入本地 CLI（access/refresh/expires_at + device-registration）。
+///
+/// 数据库不存在时返回 `Ok(false)`（未安装 CLI 不算错误）；写入成功返回 `Ok(true)`。
+pub fn sync_account_to_cli(account: &Account) -> Result<bool, String> {
+    let Some(db_path) = detect_existing_cli_database() else {
+        return Ok(false);
+    };
+    let payload = build_cli_switch_payload(account)?;
+    switch_cli_account(&db_path, &payload)?;
+    Ok(true)
 }
 
 /// 获取 CLI 数据库候选路径

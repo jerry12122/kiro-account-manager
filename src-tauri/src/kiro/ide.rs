@@ -337,12 +337,14 @@ pub struct SwitchAccountParams {
     pub email: Option<String>,
 }
 
-/// 切换 Kiro 账号（原子写入 Token 文件，无需重启 IDE）
+/// 切换 Kiro 账号（原子写入 Token 文件，无需重启 IDE）。
+/// IDE 写成功后会尽量同步 CLI（无 CLI 数据库时跳过，不影响 IDE 切号结果）。
 #[tauri::command]
 pub async fn switch_kiro_account(
     params: SwitchAccountParams,
 ) -> Result<SwitchAccountResult, String> {
-    tokio::task::spawn_blocking(move || {
+    let params_for_cli = params.clone();
+    let result = tokio::task::spawn_blocking(move || {
         let auth_method = params.auth_method.unwrap_or_else(|| "social".to_string());
         let access_token = params.access_token;
         let refresh_token = params.refresh_token;
@@ -636,7 +638,52 @@ pub async fn switch_kiro_account(
         })
     })
     .await
-    .map_err(|e| format!("Task failed: {e}"))?
+    .map_err(|e| format!("Task failed: {e}"))??;
+
+    // IDE 切号成功后同步 CLI（失败只告警，不回滚 IDE）
+    sync_cli_after_ide_switch(&params_for_cli);
+
+    Ok(result)
+}
+
+/// 用切号参数构造最小 Account，写 CLI access/refresh/expires_at
+fn sync_cli_after_ide_switch(params: &SwitchAccountParams) {
+    let email = params
+        .email
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut account = crate::core::account::Account::new(email, String::new());
+    account.access_token = Some(params.access_token.clone());
+    account.refresh_token = Some(params.refresh_token.clone());
+    account.provider = Some(params.provider.clone());
+    account.auth_method = params.auth_method.clone();
+    account.profile_arn = params.profile_arn.clone();
+    account.start_url = params.start_url.clone();
+    account.client_id = params.client_id.clone();
+    account.client_secret = params.client_secret.clone();
+    account.region = params.region.clone();
+    // 与 IDE 切号一致：本地写入时按 now+1h 记过期（params 不含 expires）
+    account.expires_at = Some(
+        (chrono::Utc::now() + chrono::Duration::hours(1))
+            .with_timezone(&chrono::Local)
+            .format("%Y/%m/%d %H:%M:%S")
+            .to_string(),
+    );
+
+    match crate::kiro::cli::sync_account_to_cli(&account) {
+        Ok(true) => log::info!(
+            "[switch_kiro_account] also wrote CLI credentials for {}",
+            params.email.as_deref().unwrap_or("未知")
+        ),
+        Ok(false) => log::debug!(
+            "[switch_kiro_account] skip CLI write: database not found ({})",
+            params.email.as_deref().unwrap_or("未知")
+        ),
+        Err(e) => log::warn!(
+            "[switch_kiro_account] CLI sync failed after IDE switch ({}): {e}",
+            params.email.as_deref().unwrap_or("未知")
+        ),
+    }
 }
 
 /// 退出当前 Kiro IDE 登录（删除本地 token 文件，账号仍保留在 KAM 列表中）
