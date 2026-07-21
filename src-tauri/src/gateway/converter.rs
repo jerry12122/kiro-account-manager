@@ -1456,8 +1456,8 @@ pub async fn build_kiro_payload(
             },
         });
 
-        // sanitize 所有消息（包括 currentMessage）
-        let all_sanitized = sanitize_history(history_items);
+        // sanitize 所有消息（包括 currentMessage）；传入当前模型以便补齐空 modelId
+        let all_sanitized = sanitize_history(history_items, &model_id);
 
         // 分割：最后一条作为 currentMessage 的数据源，其余作为 history
         if all_sanitized.len() <= 1 {
@@ -1667,12 +1667,16 @@ fn convert_responses_input(input: &Value) -> Vec<NormalizedMessage> {
 fn convert_responses_input_items(items: &[Value]) -> Vec<NormalizedMessage> {
     let mut messages = Vec::new();
     let mut pending_user_items = Vec::new();
+    // 对齐 Chat：连续 tool output 攒批成一条 user(tool_result×N)，避免并行工具拆成多条
+    // history user 触发 Bedrock TOOL_USE_RESULT_MISMATCH。
+    let mut pending_tool_results: Vec<(String, String)> = Vec::new();
 
     for item in items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
 
         // EasyInputMessage / message 项：官方 role = system|developer|user|assistant
         if let Some(raw_role) = item.get("role").and_then(Value::as_str) {
+            flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
             flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
             let role = match raw_role {
                 "system" | "user" | "assistant" => raw_role.to_string(),
@@ -1697,6 +1701,7 @@ fn convert_responses_input_items(items: &[Value]) -> Vec<NormalizedMessage> {
 
         match item_type {
             "message" => {
+                flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
                 flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
                 // type=message 但缺 role 时官方默认按 user 处理
                 let role = "user".to_string();
@@ -1709,6 +1714,7 @@ fn convert_responses_input_items(items: &[Value]) -> Vec<NormalizedMessage> {
                 });
             }
             "function_call" => {
+                flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
                 flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
                 messages.push(NormalizedMessage {
                     role: "assistant".to_string(),
@@ -1747,22 +1753,21 @@ fn convert_responses_input_items(items: &[Value]) -> Vec<NormalizedMessage> {
             }
             "function_call_output" => {
                 flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
-                messages.push(NormalizedMessage {
-                    role: "tool".to_string(),
-                    content: responses_tool_output_content(item.get("output")),
-                    tool_calls: None,
-                    tool_call_id: item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    metadata: None,
-                });
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let content = extract_text_content(responses_tool_output_content(item.get("output")).as_ref());
+                pending_tool_results.push((call_id, content));
             }
             "input_text" | "output_text" | "input_image" | "image_url" | "image" => {
+                flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
                 pending_user_items.push(item.clone());
             }
             // OpenAI Responses 文档 reasoning item → Kiro reasoningContent
             "reasoning" => {
+                flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
                 flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
                 let mut metadata = Map::new();
                 if let Some(reasoning) = extract_responses_reasoning_item(item)
@@ -1786,13 +1791,28 @@ fn convert_responses_input_items(items: &[Value]) -> Vec<NormalizedMessage> {
             // 官方工具类 item：按 function_call / function_call_output 语义映射到 Kiro tools
             "custom_tool_call" | "web_search_call" | "file_search_call" | "code_interpreter_call"
             | "computer_call" | "local_shell_call" | "image_generation_call" | "mcp_call" => {
+                flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
                 flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
                 push_responses_tool_call_message(&mut messages, item, item_type);
             }
             "custom_tool_call_output" | "computer_call_output" | "local_shell_call_output"
             | "mcp_approval_response" => {
                 flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
-                push_responses_tool_output_message(&mut messages, item);
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let content = extract_text_content(
+                    responses_tool_output_content(
+                        item.get("output")
+                            .or_else(|| item.get("result"))
+                            .or_else(|| item.get("content")),
+                    )
+                    .as_ref(),
+                );
+                pending_tool_results.push((call_id, content));
             }
             // 会话引用：依赖 previous_response_id 恢复，input 内 item_reference 本身无正文可转
             "item_reference" => {
@@ -1808,6 +1828,7 @@ fn convert_responses_input_items(items: &[Value]) -> Vec<NormalizedMessage> {
             }
             // compaction 非 Responses 核心 input 类型；若客户端带入则保留标记（非 /compact 实现）
             "compaction" => {
+                flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
                 flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
                 messages.push(NormalizedMessage {
                     role: "system".to_string(),
@@ -1830,8 +1851,20 @@ fn convert_responses_input_items(items: &[Value]) -> Vec<NormalizedMessage> {
         }
     }
 
+    flush_pending_responses_tool_results(&mut messages, &mut pending_tool_results);
     flush_pending_responses_user_items(&mut messages, &mut pending_user_items);
     messages
+}
+
+fn flush_pending_responses_tool_results(
+    messages: &mut Vec<NormalizedMessage>,
+    pending_tool_results: &mut Vec<(String, String)>,
+) {
+    if pending_tool_results.is_empty() {
+        return;
+    }
+    messages.push(create_tool_results_message(pending_tool_results));
+    pending_tool_results.clear();
 }
 
 fn flush_pending_responses_user_items(
@@ -1959,7 +1992,8 @@ fn push_responses_tool_call_message(
     });
 }
 
-/// Responses 官方工具输出 item → role=tool
+/// Responses 官方工具输出 item → role=tool（入站已改攒批；保留供单条映射/调试）
+#[allow(dead_code)]
 fn push_responses_tool_output_message(messages: &mut Vec<NormalizedMessage>, item: &Value) {
     messages.push(NormalizedMessage {
         role: "tool".to_string(),
@@ -2233,10 +2267,13 @@ fn extract_anthropic_tool_result_id(content: &Value) -> Option<String> {
 /// 3. 补充缺失的 toolResults
 /// 4. 修复交替（插入占位消息）
 /// 5. 确保以 user 结束
-fn sanitize_history(mut items: Vec<HistoryItem>) -> Vec<HistoryItem> {
+/// 6. 补齐空 modelId（尤其是 toolResults user），避免上游 INVALID_MODEL_ID
+fn sanitize_history(mut items: Vec<HistoryItem>, fallback_model_id: &str) -> Vec<HistoryItem> {
     if items.is_empty() {
         return items;
     }
+
+    let fallback_model_id = resolve_history_fallback_model_id(&items, fallback_model_id);
 
     // 步骤 1：确保以 user 开始
     if !matches!(items.first(), Some(HistoryItem::User { .. })) {
@@ -2245,7 +2282,7 @@ fn sanitize_history(mut items: Vec<HistoryItem>) -> Vec<HistoryItem> {
             HistoryItem::User {
                 user_input_message: HistoryUserMessage {
                     content: "Hello".to_string(),
-                    model_id: String::new(),
+                    model_id: fallback_model_id.clone(),
                     origin: "AI_EDITOR".to_string(),
                     images: None,
                     user_input_message_context: None,
@@ -2288,106 +2325,281 @@ fn sanitize_history(mut items: Vec<HistoryItem>) -> Vec<HistoryItem> {
         .map(|(_, item)| item)
         .collect();
 
-    // 步骤 3：补充缺失的 toolResults
-    // 如果 assistant 有 toolUses 但下一条 user 没有对应 toolResults，插入错误占位
-    let mut patched: Vec<HistoryItem> = Vec::new();
-    for (idx, item) in items.iter().enumerate() {
-        patched.push(item.clone());
+    // 步骤 3：合并紧随 assistant 的连续 toolResults user，并按 toolUseId 全集补齐
+    // （防御 Responses 旧路径把并行 output 拆成多条 user 的情况）
+    items = merge_split_tool_result_users(items, &fallback_model_id);
 
-        if let HistoryItem::Assistant {
-            assistant_response_message,
-        } = item
-        {
-            if let Some(tool_uses) = &assistant_response_message.tool_uses {
-                if !tool_uses.is_empty() {
-                    // 检查下一条是否是带 toolResults 的 user
-                    let next = items.get(idx + 1);
-                    let next_has_results = match next {
-                        Some(HistoryItem::User { user_input_message }) => user_input_message
-                            .user_input_message_context
-                            .as_ref()
-                            .and_then(|ctx| ctx.tool_results.as_ref())
-                            .map(|r| !r.is_empty())
-                            .unwrap_or(false),
-                        _ => false,
-                    };
-
-                    if !next_has_results {
-                        // 插入错误占位的 toolResults
-                        let error_results: Vec<KiroToolResult> = tool_uses
-                            .iter()
-                            .map(|tu| KiroToolResult {
-                                tool_use_id: tu.tool_use_id.clone(),
-                                content: vec![KiroToolResultContent::Text {
-                                    text: "Tool execution failed".to_string(),
-                                }],
-                                status: "error".to_string(),
-                            })
-                            .collect();
-
-                        patched.push(HistoryItem::User {
-                            user_input_message: HistoryUserMessage {
-                                content: String::new(),
-                                model_id: String::new(),
-                                origin: "AI_EDITOR".to_string(),
-                                images: None,
-                                user_input_message_context: Some(UserInputMessageContext {
-                                    additional_context: None,
-                                    app_studio_context: None,
-                                    console_state: None,
-                                    diagnostic: None,
-                                    editor_state: None,
-                                    env_state: None,
-                                    git_state: None,
-                                    shell_state: None,
-                                    tool_results: Some(error_results),
-                                    tools: None,
-                                    user_settings: None,
-                                }),
-                            },
-                        });
-                    }
-                }
-            }
-        }
-    }
-    items = patched;
-
-    // 步骤 4：修复交替（两个连续 user 之间插入 assistant，两个连续 assistant 之间插入 user）
+    // 步骤 4：修复交替；连续纯 toolResults user 先合并，避免插入 understood 拆对
     let mut alternated: Vec<HistoryItem> = Vec::new();
     for item in items {
-        if let Some(last) = alternated.last() {
-            let both_user = matches!(last, HistoryItem::User { .. })
-                && matches!(&item, HistoryItem::User { .. });
-            let both_assistant = matches!(last, HistoryItem::Assistant { .. })
-                && matches!(&item, HistoryItem::Assistant { .. });
-
-            if both_user {
-                // 插入占位 assistant
-                alternated.push(HistoryItem::Assistant {
-                    assistant_response_message: history_assistant_message_from_response_content(
-                        "understood",
-                        &[],
-                    ),
-                });
-            } else if both_assistant {
-                // 插入占位 user
-                alternated.push(HistoryItem::User {
-                    user_input_message: HistoryUserMessage {
-                        content: "Continue".to_string(),
-                        model_id: String::new(),
-                        origin: "AI_EDITOR".to_string(),
-                        images: None,
-                        user_input_message_context: None,
-                    },
-                });
+        let needs_placeholder = match alternated.last() {
+            Some(last) => {
+                let both_user = matches!(last, HistoryItem::User { .. })
+                    && matches!(&item, HistoryItem::User { .. });
+                let both_assistant = matches!(last, HistoryItem::Assistant { .. })
+                    && matches!(&item, HistoryItem::Assistant { .. });
+                if both_user {
+                    Some("assistant")
+                } else if both_assistant {
+                    Some("user")
+                } else {
+                    None
+                }
             }
+            None => None,
+        };
+
+        if needs_placeholder == Some("assistant") {
+            if let Some(last) = alternated.last_mut() {
+                if try_merge_tool_result_users(last, &item) {
+                    continue;
+                }
+            }
+            alternated.push(HistoryItem::Assistant {
+                assistant_response_message: history_assistant_message_from_response_content(
+                    "understood",
+                    &[],
+                ),
+            });
+        } else if needs_placeholder == Some("user") {
+            alternated.push(HistoryItem::User {
+                user_input_message: HistoryUserMessage {
+                    content: "Continue".to_string(),
+                    model_id: fallback_model_id.clone(),
+                    origin: "AI_EDITOR".to_string(),
+                    images: None,
+                    user_input_message_context: None,
+                },
+            });
         }
         alternated.push(item);
     }
     items = alternated;
 
+    // 步骤 5：所有 user（含 toolResults）补齐空 modelId，防止 INVALID_MODEL_ID
+    fill_empty_user_model_ids(&mut items, &fallback_model_id);
+
     items
+}
+
+fn resolve_history_fallback_model_id(items: &[HistoryItem], preferred: &str) -> String {
+    if !preferred.trim().is_empty() {
+        return preferred.to_string();
+    }
+    items
+        .iter()
+        .find_map(|item| match item {
+            HistoryItem::User { user_input_message }
+                if !user_input_message.model_id.trim().is_empty() =>
+            {
+                Some(user_input_message.model_id.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| "claude-sonnet-4.5".to_string())
+}
+
+fn fill_empty_user_model_ids(items: &mut [HistoryItem], fallback_model_id: &str) {
+    if fallback_model_id.trim().is_empty() {
+        return;
+    }
+    for item in items {
+        if let HistoryItem::User { user_input_message } = item {
+            if user_input_message.model_id.trim().is_empty() {
+                user_input_message.model_id = fallback_model_id.to_string();
+            }
+        }
+    }
+}
+
+fn history_user_tool_results(user: &HistoryUserMessage) -> Option<&Vec<KiroToolResult>> {
+    user.user_input_message_context
+        .as_ref()
+        .and_then(|ctx| ctx.tool_results.as_ref())
+        .filter(|results| !results.is_empty())
+}
+
+fn is_pure_tool_results_user(user: &HistoryUserMessage) -> bool {
+    user.content.trim().is_empty() && history_user_tool_results(user).is_some()
+}
+
+fn error_tool_result(tool_use_id: impl Into<String>) -> KiroToolResult {
+    KiroToolResult {
+        tool_use_id: tool_use_id.into(),
+        content: vec![KiroToolResultContent::Text {
+            text: "Tool execution failed".to_string(),
+        }],
+        status: "error".to_string(),
+    }
+}
+
+fn tool_results_user_item(results: Vec<KiroToolResult>, model_id: impl Into<String>) -> HistoryItem {
+    HistoryItem::User {
+        user_input_message: HistoryUserMessage {
+            content: String::new(),
+            model_id: model_id.into(),
+            origin: "AI_EDITOR".to_string(),
+            images: None,
+            user_input_message_context: Some(UserInputMessageContext {
+                additional_context: None,
+                app_studio_context: None,
+                console_state: None,
+                diagnostic: None,
+                editor_state: None,
+                env_state: None,
+                git_state: None,
+                shell_state: None,
+                tool_results: Some(results),
+                tools: None,
+                user_settings: None,
+            }),
+        },
+    }
+}
+
+fn append_unique_tool_results(target: &mut Vec<KiroToolResult>, incoming: &[KiroToolResult]) {
+    for result in incoming {
+        if target
+            .iter()
+            .any(|existing| existing.tool_use_id == result.tool_use_id)
+        {
+            continue;
+        }
+        target.push(result.clone());
+    }
+}
+
+fn order_tool_results_by_ids(
+    mut results: Vec<KiroToolResult>,
+    ordered_ids: &[String],
+) -> Vec<KiroToolResult> {
+    let mut ordered = Vec::with_capacity(ordered_ids.len().max(results.len()));
+    for id in ordered_ids {
+        if let Some(pos) = results.iter().position(|r| r.tool_use_id == *id) {
+            ordered.push(results.remove(pos));
+        } else {
+            ordered.push(error_tool_result(id.clone()));
+        }
+    }
+    ordered.append(&mut results);
+    ordered
+}
+
+/// 把 assistant(toolUses) 后紧跟的多条纯 toolResults user 合成一条，并补齐缺失 ID
+fn merge_split_tool_result_users(
+    items: Vec<HistoryItem>,
+    fallback_model_id: &str,
+) -> Vec<HistoryItem> {
+    let mut patched: Vec<HistoryItem> = Vec::new();
+    let mut idx = 0usize;
+    while idx < items.len() {
+        let item = &items[idx];
+        if let HistoryItem::Assistant {
+            assistant_response_message,
+        } = item
+        {
+            let tool_uses = assistant_response_message
+                .tool_uses
+                .as_ref()
+                .filter(|uses| !uses.is_empty());
+            if let Some(tool_uses) = tool_uses {
+                patched.push(item.clone());
+                let needed_ids: Vec<String> =
+                    tool_uses.iter().map(|tu| tu.tool_use_id.clone()).collect();
+
+                let mut collected: Vec<KiroToolResult> = Vec::new();
+                let mut preserved_model_id = String::new();
+                let mut cursor = idx + 1;
+                while cursor < items.len() {
+                    let HistoryItem::User { user_input_message } = &items[cursor] else {
+                        break;
+                    };
+                    let Some(results) = history_user_tool_results(user_input_message) else {
+                        break;
+                    };
+                    if preserved_model_id.trim().is_empty()
+                        && !user_input_message.model_id.trim().is_empty()
+                    {
+                        preserved_model_id = user_input_message.model_id.clone();
+                    }
+                    // 仅合并空 content 的纯 toolResults 续片
+                    if !user_input_message.content.trim().is_empty() {
+                        if collected.is_empty() {
+                            append_unique_tool_results(&mut collected, results);
+                            cursor += 1;
+                        }
+                        break;
+                    }
+                    append_unique_tool_results(&mut collected, results);
+                    cursor += 1;
+                }
+
+                let model_id = if !preserved_model_id.trim().is_empty() {
+                    preserved_model_id
+                } else {
+                    fallback_model_id.to_string()
+                };
+
+                if collected.is_empty() {
+                    let error_results: Vec<KiroToolResult> =
+                        needed_ids.iter().cloned().map(error_tool_result).collect();
+                    patched.push(tool_results_user_item(error_results, model_id));
+                    idx += 1;
+                    continue;
+                }
+
+                let ordered = order_tool_results_by_ids(collected, &needed_ids);
+                patched.push(tool_results_user_item(ordered, model_id));
+                idx = cursor;
+                continue;
+            }
+        }
+
+        patched.push(item.clone());
+        idx += 1;
+    }
+    patched
+}
+
+/// 若两条连续 user 都是纯 toolResults，合并进 `last` 并返回 true
+fn try_merge_tool_result_users(last: &mut HistoryItem, next: &HistoryItem) -> bool {
+    let can_merge = matches!(
+        (&*last, next),
+        (
+            HistoryItem::User {
+                user_input_message: last_user
+            },
+            HistoryItem::User {
+                user_input_message: next_user
+            }
+        ) if is_pure_tool_results_user(last_user) && is_pure_tool_results_user(next_user)
+    );
+    if !can_merge {
+        return false;
+    }
+
+    let next_results = match next {
+        HistoryItem::User { user_input_message } => {
+            history_user_tool_results(user_input_message).cloned()
+        }
+        _ => None,
+    };
+    let Some(next_results) = next_results else {
+        return false;
+    };
+
+    match last {
+        HistoryItem::User { user_input_message } => {
+            if let Some(ctx) = user_input_message.user_input_message_context.as_mut() {
+                let target = ctx.tool_results.get_or_insert_with(Vec::new);
+                append_unique_tool_results(target, &next_results);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 fn merge_adjacent_messages(messages: &[&NormalizedMessage]) -> Vec<NormalizedMessage> {
@@ -2395,7 +2607,12 @@ fn merge_adjacent_messages(messages: &[&NormalizedMessage]) -> Vec<NormalizedMes
 
     for message in messages {
         if let Some(last) = merged.last_mut() {
-            if last.role == message.role && last.role != "tool" {
+            // 不合并 tool / 含 tool_result 的 user，避免并行工具结果被拼成纯文本后丢失
+            let can_merge = last.role == message.role
+                && last.role != "tool"
+                && !normalized_message_has_tool_results(last)
+                && !normalized_message_has_tool_results(message);
+            if can_merge {
                 let existing = extract_text_content(last.content.as_ref());
                 let incoming = extract_text_content(message.content.as_ref());
                 last.content = Some(Value::String(join_with_newline(&existing, &incoming)));
@@ -3822,13 +4039,14 @@ mod tests {
             Some(json!({ "type": "function", "name": "search_docs" }))
         );
         assert_eq!(converted.tools.as_ref().map(Vec::len), Some(1));
+        // Responses tools 会规范化为 camelCase（search_docs → searchDocs）
         assert_eq!(
             converted
                 .tools
                 .as_ref()
                 .and_then(|items| items.first())
                 .map(|tool| tool.function.name.as_str()),
-            Some("search_docs")
+            Some("searchDocs")
         );
         assert_eq!(converted.messages.len(), 3);
         assert_eq!(converted.messages[0].role, "user");
@@ -3846,12 +4064,365 @@ mod tests {
                 .map(|call| call.function.name.as_str()),
             Some("search_docs")
         );
-        assert_eq!(converted.messages[2].role, "tool");
+        assert_eq!(converted.messages[2].role, "user");
         assert_eq!(
-            converted.messages[2].tool_call_id.as_deref(),
-            Some("call_1")
+            converted.messages[2].content,
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": "命中结果"
+            }]))
         );
-        assert_eq!(converted.messages[2].content, Some(json!("命中结果")));
+    }
+
+    #[test]
+    fn normalize_openai_responses_request_batches_parallel_function_call_outputs() {
+        let payload = json!({
+            "model": "claude-sonnet-4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "并行查两次" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "search_a",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_b",
+                    "name": "search_b",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_a",
+                    "output": "result_a"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_b",
+                    "output": "result_b"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "继续" }]
+                }
+            ]
+        });
+
+        let converted =
+            normalize_openai_responses_request(&payload).expect("responses payload should convert");
+
+        // function_call 各成一条 assistant；合批依赖 build 阶段 merge_adjacent_messages
+        assert_eq!(converted.messages.len(), 5);
+        assert_eq!(converted.messages[0].role, "user");
+        assert_eq!(converted.messages[1].role, "assistant");
+        assert_eq!(converted.messages[2].role, "assistant");
+        assert_eq!(converted.messages[3].role, "user");
+        assert_eq!(
+            converted.messages[3].content,
+            Some(json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_a",
+                    "content": "result_a"
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_b",
+                    "content": "result_b"
+                }
+            ]))
+        );
+        assert_eq!(converted.messages[4].role, "user");
+
+        let refs: Vec<&NormalizedMessage> = converted.messages.iter().collect();
+        let merged = merge_adjacent_messages(&refs);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[1].tool_calls.as_ref().map(Vec::len), Some(2));
+        assert_eq!(merged[2].role, "user");
+        assert_eq!(
+            merged[2].content,
+            Some(json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_a",
+                    "content": "result_a"
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_b",
+                    "content": "result_b"
+                }
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn build_kiro_payload_keeps_batched_parallel_tool_results_together() {
+        let request = NormalizedRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            messages: vec![
+                NormalizedMessage {
+                    role: "user".to_string(),
+                    content: Some(json!("并行查两次")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    metadata: None,
+                },
+                NormalizedMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![
+                        ToolCall {
+                            id: "call_a".to_string(),
+                            call_type: "function".to_string(),
+                            function: ToolCallFunction {
+                                name: "search_a".to_string(),
+                                arguments: "{}".to_string(),
+                            },
+                        },
+                        ToolCall {
+                            id: "call_b".to_string(),
+                            call_type: "function".to_string(),
+                            function: ToolCallFunction {
+                                name: "search_b".to_string(),
+                                arguments: "{}".to_string(),
+                            },
+                        },
+                    ]),
+                    tool_call_id: None,
+                    metadata: None,
+                },
+                create_tool_results_message(&[
+                    ("call_a".to_string(), "result_a".to_string()),
+                    ("call_b".to_string(), "result_b".to_string()),
+                ]),
+                NormalizedMessage {
+                    role: "user".to_string(),
+                    content: Some(json!("继续")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    metadata: None,
+                },
+            ],
+            stream: false,
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            previous_response_id: None,
+            thinking: None,
+            include_usage: false,
+            tool_name_map: Default::default(),
+        };
+
+        let payload = build_kiro_payload(&Client::new(), &request, None, None)
+            .await
+            .expect("payload should build");
+        let history = payload
+            .conversation_state
+            .history
+            .expect("history should exist");
+
+        let assistant_idx = history
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    HistoryItem::Assistant {
+                        assistant_response_message
+                    } if assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(|uses| uses.len() == 2)
+                        .unwrap_or(false)
+                )
+            })
+            .expect("assistant with 2 toolUses");
+
+        match &history[assistant_idx + 1] {
+            HistoryItem::User { user_input_message } => {
+                let results = user_input_message
+                    .user_input_message_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.tool_results.as_ref())
+                    .expect("next user must carry toolResults");
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0].tool_use_id, "call_a");
+                assert_eq!(results[1].tool_use_id, "call_b");
+            }
+            other => panic!(
+                "expected toolResults user immediately after assistant (no understood gap), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn sanitize_history_merges_split_tool_result_users_by_tool_use_ids() {
+        let items = vec![
+            HistoryItem::User {
+                user_input_message: HistoryUserMessage {
+                    content: "start".to_string(),
+                    model_id: "claude-sonnet-4.5".to_string(),
+                    origin: "AI_EDITOR".to_string(),
+                    images: None,
+                    user_input_message_context: None,
+                },
+            },
+            HistoryItem::Assistant {
+                assistant_response_message: history_assistant_message_from_response_content(
+                    "",
+                    &[
+                        ("call_a".to_string(), "search_a".to_string(), "{}".to_string()),
+                        ("call_b".to_string(), "search_b".to_string(), "{}".to_string()),
+                    ],
+                ),
+            },
+            tool_results_user_item(
+                vec![KiroToolResult {
+                    tool_use_id: "call_a".to_string(),
+                    content: vec![KiroToolResultContent::Text {
+                        text: "result_a".to_string(),
+                    }],
+                    status: "success".to_string(),
+                }],
+                "claude-sonnet-4.5",
+            ),
+            tool_results_user_item(
+                vec![KiroToolResult {
+                    tool_use_id: "call_b".to_string(),
+                    content: vec![KiroToolResultContent::Text {
+                        text: "result_b".to_string(),
+                    }],
+                    status: "success".to_string(),
+                }],
+                "",
+            ),
+            HistoryItem::User {
+                user_input_message: HistoryUserMessage {
+                    content: "继续".to_string(),
+                    model_id: String::new(),
+                    origin: "AI_EDITOR".to_string(),
+                    images: None,
+                    user_input_message_context: None,
+                },
+            },
+        ];
+
+        let sanitized = sanitize_history(items, "claude-sonnet-4.5");
+
+        let assistant_idx = sanitized
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    HistoryItem::Assistant {
+                        assistant_response_message
+                    } if assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(|uses| uses.len() == 2)
+                        .unwrap_or(false)
+                )
+            })
+            .expect("assistant with 2 toolUses");
+
+        match &sanitized[assistant_idx + 1] {
+            HistoryItem::User { user_input_message } => {
+                let results = user_input_message
+                    .user_input_message_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.tool_results.as_ref())
+                    .expect("merged toolResults user");
+                assert_eq!(results.len(), 2);
+                let ids: Vec<&str> = results.iter().map(|r| r.tool_use_id.as_str()).collect();
+                assert_eq!(ids, vec!["call_a", "call_b"]);
+                assert_eq!(
+                    user_input_message.model_id, "claude-sonnet-4.5",
+                    "merged toolResults user must keep modelId"
+                );
+            }
+            other => panic!(
+                "expected merged toolResults user immediately after assistant, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn sanitize_history_fills_empty_model_id_on_tool_results_user() {
+        // 复现：第二轮 tool 续写时，history 里上一轮 toolResults user 的 modelId 被抹成空 → INVALID_MODEL_ID
+        let items = vec![
+            HistoryItem::User {
+                user_input_message: HistoryUserMessage {
+                    content: "start".to_string(),
+                    model_id: "claude-sonnet-4.5".to_string(),
+                    origin: "AI_EDITOR".to_string(),
+                    images: None,
+                    user_input_message_context: None,
+                },
+            },
+            HistoryItem::Assistant {
+                assistant_response_message: history_assistant_message_from_response_content(
+                    " ",
+                    &[(
+                        "call_1".to_string(),
+                        "shellCommand".to_string(),
+                        "{}".to_string(),
+                    )],
+                ),
+            },
+            tool_results_user_item(
+                vec![KiroToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![KiroToolResultContent::Text {
+                        text: "ok".to_string(),
+                    }],
+                    status: "success".to_string(),
+                }],
+                "", // 空 modelId（旧 sanitize 重写产物）
+            ),
+            HistoryItem::Assistant {
+                assistant_response_message: history_assistant_message_from_response_content(
+                    " ",
+                    &[(
+                        "call_2".to_string(),
+                        "shellCommand".to_string(),
+                        "{}".to_string(),
+                    )],
+                ),
+            },
+            tool_results_user_item(
+                vec![KiroToolResult {
+                    tool_use_id: "call_2".to_string(),
+                    content: vec![KiroToolResultContent::Text {
+                        text: "ok2".to_string(),
+                    }],
+                    status: "success".to_string(),
+                }],
+                "claude-sonnet-4.5",
+            ),
+        ];
+
+        let sanitized = sanitize_history(items, "claude-sonnet-4.5");
+
+        for item in &sanitized {
+            if let HistoryItem::User { user_input_message } = item {
+                assert!(
+                    !user_input_message.model_id.trim().is_empty(),
+                    "history user must not have empty modelId (got content_len={})",
+                    user_input_message.content.len()
+                );
+                assert_eq!(user_input_message.model_id, "claude-sonnet-4.5");
+            }
+        }
     }
 
     #[test]
@@ -3944,8 +4515,15 @@ mod tests {
                 .map(|c| c.function.name.as_str()),
             Some("lookup")
         );
-        assert_eq!(converted.messages[3].role, "tool");
-        assert_eq!(converted.messages[3].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(converted.messages[3].role, "user");
+        assert_eq!(
+            converted.messages[3].content,
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call_2",
+                "content": "ok"
+            }]))
+        );
         // unknown type 被跳过，不伪造 user 文本
         assert_eq!(converted.messages.len(), 4);
     }
